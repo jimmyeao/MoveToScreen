@@ -8,6 +8,7 @@ mod jumplist;
 mod mover;
 mod resolver;
 mod state;
+mod watch;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -36,13 +37,17 @@ enum Cmd {
     Uninstall,
     /// List discovered app IDs and their registration state
     List,
-    /// Register (or remove) a scheduled task that re-injects every 10 minutes —
-    /// needed because some apps rewrite their own jump lists and drop our task
+    /// Register (or remove) the guard: a logon Run-key entry for `watch` plus
+    /// a 10-minute `install` fallback — needed because some apps rewrite
+    /// their own jump lists and drop our task
     Guard {
-        /// Remove the scheduled re-inject task
+        /// Remove the guard (Run-key entry + scheduled task + running watcher)
         #[arg(long)]
         off: bool,
     },
+    /// Watch the jump-list store and re-inject the instant an app rewrites its
+    /// list — normally started by `guard` at logon; run directly for testing
+    Watch,
     /// Inject the task for one app only (diagnostics / selective re-register)
     #[command(hide = true)]
     Inject {
@@ -103,6 +108,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::List) => cmd_list()?,
         Some(Cmd::Guard { off }) => cmd_guard(off)?,
+        Some(Cmd::Watch) => watch::run()?,
         Some(Cmd::Inject { aumid }) => {
             let app = discovery::discover_apps()?
                 .into_iter()
@@ -152,14 +158,14 @@ fn main() -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let registered = state::load()?;
+    let registered = state::apps()?;
     let found = discovery::discover_apps()?;
     if found.is_empty() {
         cout("No apps discovered (need a running window or pinned taskbar shortcut).".into());
         return Ok(());
     }
     for app in &found {
-        let mark = if registered.contains(&app.aumid) { "[registered]" } else { "" };
+        let mark = if registered.contains_key(&app.aumid) { "[registered]" } else { "" };
         let exe = app.exe.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into());
         cout(format!("{}  {}  {mark}", app.aumid, exe));
     }
@@ -168,12 +174,12 @@ fn cmd_list() -> Result<()> {
 
 fn cmd_install() -> Result<()> {
     let found = discovery::discover_apps()?;
-    let mut registered = state::load()?;
+    let mut registered = state::apps()?;
     let mut ok = 0usize;
     for app in &found {
         match jumplist::inject(app) {
             Ok(()) => {
-                registered.insert(app.aumid.clone());
+                registered.insert(app.aumid.clone(), app.exe.clone());
                 ok += 1;
             }
             Err(e) => cout(format!("{}: failed — {e:#}", app.aumid)),
@@ -189,30 +195,56 @@ fn cmd_install() -> Result<()> {
 }
 
 fn cmd_guard(off: bool) -> Result<()> {
-    const TASK: &str = "JumpScreen-Reinject";
-    let mut args: Vec<String> = vec!["/delete".into(), "/tn".into(), TASK.into(), "/f".into()];
-    let mut what = "removed";
-    if !off {
-        args = vec![
-            "/create".into(), "/tn".into(), TASK.into(),
-            "/tr".into(), format!("\\\"{}\\\" install", std::env::current_exe()?.display()),
-            "/sc".into(), "minute".into(), "/mo".into(), "10".into(),
-            "/it".into(), "/f".into(),
-        ];
-        what = "registered (every 10 min, only while logged on)";
+    const REINJECT: &str = "JumpScreen-Reinject";
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let _ = std::process::Command::new("schtasks")
+        .args(["/delete", "/tn", REINJECT, "/f"])
+        .output();
+    let _ = std::process::Command::new("reg")
+        .args(["delete", RUN_KEY, "/v", "JumpScreen", "/f"])
+        .output();
+    if off {
+        // A `watch` process started at logon outlives the registration — kill
+        // any other instance of this exe (filtered so we don't kill ourselves).
+        let _ = std::process::Command::new("taskkill")
+            .args([
+                "/f", "/im", "jumpscreen.exe",
+                "/fi", &format!("PID ne {}", std::process::id()),
+            ])
+            .output();
+        cout("guard removed (watcher stopped)".into());
+        return Ok(());
     }
-    let out = std::process::Command::new("schtasks").args(&args).output()?;
+    let exe = std::env::current_exe()?.display().to_string();
+    // ONLOGON scheduled tasks need admin for an all-users trigger — the HKCU
+    // Run key is the plain per-user way to launch `watch` at logon.
+    let reg = std::process::Command::new("reg")
+        .args([
+            "add", RUN_KEY, "/v", "JumpScreen", "/t", "REG_SZ",
+            "/d", &format!("\"{exe}\" watch"), "/f",
+        ])
+        .output()?;
+    if !reg.status.success() {
+        anyhow::bail!("reg add failed: {}", String::from_utf8_lossy(&reg.stderr));
+    }
+    let out = std::process::Command::new("schtasks")
+        .args([
+            "/create", "/tn", REINJECT,
+            "/tr", &format!("\\\"{exe}\\\" install"),
+            "/sc", "minute", "/mo", "10", "/it", "/f",
+        ])
+        .output()?;
     if !out.status.success() {
         anyhow::bail!("schtasks failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    cout(format!("re-inject task {what}"));
+    cout("guard registered: 'watch' at logon + 'install' every 10 min".into());
     Ok(())
 }
 
 fn cmd_uninstall() -> Result<()> {
-    let registered = state::load()?;
+    let registered = state::apps()?;
     let mut ok = 0usize;
-    for aumid in &registered {
+    for aumid in registered.keys() {
         match jumplist::remove(aumid) {
             Ok(()) => ok += 1,
             Err(e) => cout(format!("{aumid}: failed — {e:#}")),
